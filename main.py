@@ -44,26 +44,30 @@ def hello():
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
+    """Test endpoint to check if database and search env are available"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
         "database_url": None,
         "database_name": None,
         "connection_status": "Not Connected",
-        "collections": []
+        "collections": [],
+        "google_search": {
+            "GOOGLE_API_KEY": "✅ Set" if os.getenv("GOOGLE_API_KEY") else "❌ Not Set",
+            "GOOGLE_CSE_ID": "✅ Set" if os.getenv("GOOGLE_CSE_ID") else "❌ Not Set",
+        },
     }
-    
+
     try:
         # Try to import database module
         from database import db
-        
+
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Configured"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
+
             # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
@@ -73,17 +77,16 @@ def test_database():
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
+
     except ImportError:
         response["database"] = "❌ Database module not found (run enable-database first)"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
+
     # Check environment variables
-    import os
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
 
 
@@ -137,6 +140,7 @@ WIKI_OPENSEARCH = "https://en.wikipedia.org/w/api.php"
 
 
 def wiki_answer(question: str) -> Optional[SolveResponse]:
+    """Try to answer using Wikipedia's REST summary and search."""
     try:
         # First, try direct summary by title guess
         title_guess = question.strip().rstrip('?').title()
@@ -166,9 +170,57 @@ def wiki_answer(question: str) -> Optional[SolveResponse]:
                 title = arr[1][0]
                 desc = arr[2][0] if arr[2] else None
                 link = arr[3][0] if arr[3] else None
+                # Try to upgrade with a summary call using the found title
+                try:
+                    rs = requests.get(WIKI_SEARCH_URL + requests.utils.quote(title), timeout=6)
+                    if rs.status_code == 200 and rs.json().get("extract"):
+                        data = rs.json()
+                        link = data.get("content_urls", {}).get("desktop", {}).get("page") or link
+                        desc = data.get("extract") or desc
+                except Exception:
+                    pass
                 return SolveResponse(
                     answer=title,
                     explanation=desc,
+                    qtype="factual",
+                    sources=[link] if link else []
+                )
+    except Exception:
+        pass
+    return None
+
+
+GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+
+def google_answer(question: str) -> Optional[SolveResponse]:
+    """
+    Use Google Programmable Search (if configured) to fetch a top result
+    and return its title/snippet and link. Requires env GOOGLE_API_KEY and GOOGLE_CSE_ID.
+    """
+    api_key = os.getenv("GOOGLE_API_KEY")
+    cse_id = os.getenv("GOOGLE_CSE_ID")
+    if not api_key or not cse_id:
+        return None
+    try:
+        params = {
+            "key": api_key,
+            "cx": cse_id,
+            "q": question,
+            "num": 1,
+        }
+        r = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("items", [])
+            if items:
+                item = items[0]
+                title = item.get("title") or "Top search result"
+                snippet = item.get("snippet") or item.get("htmlSnippet")
+                link = item.get("link")
+                return SolveResponse(
+                    answer=title,
+                    explanation=snippet,
                     qtype="factual",
                     sources=[link] if link else []
                 )
@@ -225,7 +277,8 @@ def solve(req: SolveRequest):
     if is_math_question(q):
         result = solve_math(q)
     else:
-        result = wiki_answer(q) or generic_answer(q)
+        # Try Wikipedia first, then Google (if configured), then generic guidance
+        result = wiki_answer(q) or google_answer(q) or generic_answer(q)
 
     # Persist to DB (best-effort)
     try:
