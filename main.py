@@ -96,7 +96,7 @@ MATH_PATTERN = re.compile(r"^[\s\d\+\-\*/\^\(\)xX=\.]+$")
 
 def is_math_question(q: str) -> bool:
     q = q.strip()
-    if any(word in q.lower() for word in ["solve", "simplify", "evaluate"]):
+    if any(word in q.lower() for word in ["solve", "simplify", "evaluate", "derivative", "integrate", "factor", "expand"]):
         return True
     return bool(MATH_PATTERN.match(q))
 
@@ -110,13 +110,17 @@ def solve_math(question: str) -> SolveResponse:
     # Try to detect equation and solve for x
     if "=" in expr_text:
         left, right = expr_text.split("=", 1)
-        x = sp.symbols('x')
+        # allow common symbols
+        symbols = list({ch for ch in re.findall(r"[a-zA-Z]", expr_text)}) or ['x']
+        syms = sp.symbols(' '.join(symbols))
+        # Map single 'x' for convenience
+        x = syms[0] if isinstance(syms, (list, tuple)) else syms
         try:
             sol = sp.solve(sp.Eq(sp.sympify(left), sp.sympify(right)), x)
-            answer = f"x = {sol}"
-            explanation = f"Solved the equation by isolating x using symbolic algebra. Solutions: {sol}"
+            answer = f"{symbols[0]} = {sol}"
+            explanation = f"Solved the equation symbolically for {symbols[0]}. Solutions: {sol}"
             return SolveResponse(answer=str(answer), explanation=explanation, qtype="math")
-        except Exception as e:
+        except Exception:
             # Fall back to evaluation if possible
             pass
 
@@ -174,15 +178,40 @@ def wiki_answer(question: str) -> Optional[SolveResponse]:
 
 
 def generic_answer(question: str) -> SolveResponse:
-    # Very simple heuristic-based response if no math/factual found
+    # Always provide a helpful, structured response and give quick search links
+    q_lower = question.strip().rstrip('.').rstrip('?').lower()
+    templates = []
+
+    if q_lower.startswith("who is") or q_lower.startswith("who was"):
+        templates.append("Try clarifying the person's full name and key role or era (e.g., 'Who is Ada Lovelace, the 19th‑century mathematician?').")
+    elif q_lower.startswith("what is") or q_lower.startswith("what are"):
+        templates.append("Add the domain for precision (e.g., 'What is entropy in thermodynamics?').")
+    elif q_lower.startswith("when "):
+        templates.append("Include the event and region (e.g., 'When did the Meiji Restoration begin in Japan?').")
+    elif q_lower.startswith("where "):
+        templates.append("Specify the context or field (e.g., geography, history, biology).")
+    elif q_lower.startswith("why "):
+        templates.append("Mention the mechanism or theory you expect (cause/effect, model names).")
+
+    if not templates:
+        templates.append("If it's factual, include specific keywords (names, dates, field). If it's math, include an explicit expression or equation.")
+
+    # Provide quick search links so the user can open authoritative results
+    try:
+        google = f"https://www.google.com/search?q={requests.utils.quote(question)}"
+        wiki = f"https://en.wikipedia.org/w/index.php?search={requests.utils.quote(question)}"
+        sources = [google, wiki]
+    except Exception:
+        sources = []
+
     return SolveResponse(
         answer="Here's a concise explanation:",
         explanation=(
-            "I couldn't find a direct factual summary. Try rephrasing the question "
-            "or include more specific keywords. For math, include an explicit expression or equation."
+            "I couldn't find a direct factual summary. "
+            + " ".join(templates)
         ),
         qtype="general",
-        sources=[],
+        sources=sources,
     )
 
 
