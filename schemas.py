@@ -12,7 +12,7 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 # Example schemas (replace with your own):
 
@@ -40,6 +40,17 @@ class Product(BaseModel):
 
 # Add your own schemas here:
 # --------------------------------------------------
+
+class Homeworkquery(BaseModel):
+    """
+    Homework queries submitted by users
+    Collection name: "homeworkquery" (lowercase of class name)
+    """
+    question: str = Field(..., description="User's question or homework prompt")
+    answer: Optional[str] = Field(None, description="Direct answer or concise result if applicable")
+    explanation: Optional[str] = Field(None, description="Step-by-step reasoning or explanation")
+    qtype: str = Field("general", description="Detected question type: math, factual, general")
+    sources: List[str] = Field(default_factory=list, description="List of source URLs used")
 
 # Note: The Flames database viewer will automatically:
 # 1. Read these schemas from GET /schema endpoint

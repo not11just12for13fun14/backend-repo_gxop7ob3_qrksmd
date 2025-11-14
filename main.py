@@ -1,6 +1,13 @@
 import os
-from fastapi import FastAPI
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from datetime import datetime
+import re
+import requests
+
+# Optional heavy imports guarded inside functions to speed cold start
 
 app = FastAPI()
 
@@ -12,13 +19,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class SolveRequest(BaseModel):
+    question: str
+
+
+class SolveResponse(BaseModel):
+    answer: str
+    explanation: Optional[str] = None
+    qtype: str = "general"
+    sources: List[str] = []
+    created_at: datetime = datetime.utcnow()
+
+
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Homework Solver API is running"}
+
 
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
 
 @app.get("/test")
 def test_database():
@@ -63,6 +85,153 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     
     return response
+
+
+# --------------------------
+# Solver utilities
+# --------------------------
+
+MATH_PATTERN = re.compile(r"^[\s\d\+\-\*/\^\(\)xX=\.]+$")
+
+
+def is_math_question(q: str) -> bool:
+    q = q.strip()
+    if any(word in q.lower() for word in ["solve", "simplify", "evaluate"]):
+        return True
+    return bool(MATH_PATTERN.match(q))
+
+
+def solve_math(question: str) -> SolveResponse:
+    # Defer import to speed startup
+    import sympy as sp
+
+    expr_text = question.replace("^", "**").strip()
+
+    # Try to detect equation and solve for x
+    if "=" in expr_text:
+        left, right = expr_text.split("=", 1)
+        x = sp.symbols('x')
+        try:
+            sol = sp.solve(sp.Eq(sp.sympify(left), sp.sympify(right)), x)
+            answer = f"x = {sol}"
+            explanation = f"Solved the equation by isolating x using symbolic algebra. Solutions: {sol}"
+            return SolveResponse(answer=str(answer), explanation=explanation, qtype="math")
+        except Exception as e:
+            # Fall back to evaluation if possible
+            pass
+
+    try:
+        sym = sp.sympify(expr_text)
+        val = sp.simplify(sym)
+        return SolveResponse(answer=str(val), explanation="Simplified the expression using symbolic math.", qtype="math")
+    except Exception as e:
+        return SolveResponse(answer="Could not parse math expression.", explanation=str(e), qtype="math")
+
+
+WIKI_SEARCH_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+WIKI_OPENSEARCH = "https://en.wikipedia.org/w/api.php"
+
+
+def wiki_answer(question: str) -> Optional[SolveResponse]:
+    try:
+        # First, try direct summary by title guess
+        title_guess = question.strip().rstrip('?').title()
+        r = requests.get(WIKI_SEARCH_URL + requests.utils.quote(title_guess), timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("extract"):
+                url = data.get("content_urls", {}).get("desktop", {}).get("page")
+                return SolveResponse(
+                    answer=data.get("title", title_guess),
+                    explanation=data.get("extract"),
+                    qtype="factual",
+                    sources=[url] if url else []
+                )
+        # Fallback: opensearch
+        params = {
+            "action": "opensearch",
+            "search": question,
+            "limit": 1,
+            "namespace": 0,
+            "format": "json",
+        }
+        r2 = requests.get(WIKI_OPENSEARCH, params=params, timeout=6)
+        if r2.status_code == 200:
+            arr = r2.json()
+            if len(arr) >= 4 and arr[1]:
+                title = arr[1][0]
+                desc = arr[2][0] if arr[2] else None
+                link = arr[3][0] if arr[3] else None
+                return SolveResponse(
+                    answer=title,
+                    explanation=desc,
+                    qtype="factual",
+                    sources=[link] if link else []
+                )
+    except Exception:
+        pass
+    return None
+
+
+def generic_answer(question: str) -> SolveResponse:
+    # Very simple heuristic-based response if no math/factual found
+    return SolveResponse(
+        answer="Here's a concise explanation:",
+        explanation=(
+            "I couldn't find a direct factual summary. Try rephrasing the question "
+            "or include more specific keywords. For math, include an explicit expression or equation."
+        ),
+        qtype="general",
+        sources=[],
+    )
+
+
+@app.post("/solve", response_model=SolveResponse)
+def solve(req: SolveRequest):
+    q = req.question.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    # Decide path
+    if is_math_question(q):
+        result = solve_math(q)
+    else:
+        result = wiki_answer(q) or generic_answer(q)
+
+    # Persist to DB (best-effort)
+    try:
+        from database import create_document
+        # Derive collection from schema name: "homeworkquery"
+        doc = {
+            "question": q,
+            "answer": result.answer,
+            "explanation": result.explanation,
+            "qtype": result.qtype,
+            "sources": result.sources,
+        }
+        create_document("homeworkquery", doc)
+    except Exception:
+        # Database might not be configured; ignore errors for functionality
+        pass
+
+    return result
+
+
+@app.get("/history")
+def history(limit: int = 10):
+    try:
+        from database import get_documents
+        docs = get_documents("homeworkquery", {}, limit=limit)
+        # Convert ObjectId and datetime to strings
+        for d in docs:
+            if "_id" in d:
+                d["_id"] = str(d["_id"])
+            for k, v in list(d.items()):
+                if hasattr(v, "isoformat"):
+                    d[k] = v.isoformat()
+        return {"items": docs}
+    except Exception:
+        return {"items": []}
 
 
 if __name__ == "__main__":
